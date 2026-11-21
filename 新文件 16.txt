@@ -1,0 +1,156 @@
+WorkBuddy
+客户端是不是还缺少什么东西没给服务端
+
+
+不是。按现在的日志看，客户端没有少给服务端东西，SteamVR 其实已经识别到了 ALVR 虚拟头显。
+
+服务端证据
+SteamVR\logs\vrserver.txt 23:02:52 明确写了：
+
+text
+
+Loaded server driver alvr_server ... from
+D:\HuaweiVRGlass_ALVR_Windows_v0.5.0\bin\win64\driver_alvr_server.dll
+
+Driver 'alvr_server' started activation of tracked device
+with serial number '1WMHH000X00000'
+
+Active HMD set to alvr_server.1WMHH000X00000
+后面还加入了左右手柄和 skeletal hands。hmd_mirror_debug.txt 也显示：
+
+text
+
+\\.\DISPLAY2 glasses=true attached=true 3200x1600
+设备端网络也是通的：
+
+text
+
+tcp OnePlus-7T:9943 -> SteamDeck:8897 ESTABLISHED
+udp 9944 <-> 9944 ESTABLISHED
+所以“客户端握手信息不全”这个方向基本排除：如果没握手成功，不会有 HMD active、不会有视频流端口、也不会有镜像显示。
+
+为什么你觉得 SteamVR 没识别眼镜
+这套方案里 SteamVR 看到的不是“华为 VR Glass 物理头显”，而是 ALVR 驱动的虚拟 HMD：
+
+text
+
+alvr_server.1WMHH000X00000
+输入配置里甚至会显示成 generic oculus_hmd。这是正常的。真实的华为眼镜接在手机 HDMI 上，由手机端 XrShim 合成后显示；PC 端SteamVR只负责把画面渲染进 ALVR 虚拟显示，不会在设备列表里出现“HUAWEI VR Glass”这个名字。
+
+那些报错怎么解释
+crash_log.txt 里 23:02 的：
+
+text
+
+Handshake error ... 10053
+Dropping video packet. Reason: Video send thread disconnected
+是我们刚才反复 force-stop 手机 App 做验证造成的瞬时断连；之后 tcp/udp 已经重新 ESTABLISHED。测试期间请不要再强制停止 App，否则 SteamVR 会短暂显示头显断开。
+
+另外日志里大量：
+
+text
+
+VendorSpecificEvent 111 outside of reserved range
+是 ALVR 驱动发 vendor event 的噪声，当前没有阻止 HMD 注册。
+
+你现在可以这样确认
+完全退出 SteamVR（确保 vrserver.exe 也退出），再重新打开；
+保持手机上的 .HuaweiVrActivity 不要 force-stop；
+SteamVR 状态里会看到一个 HMD/头显图标，但名字可能是 ALVR、generic HMD 或类似 Oculus，不会写“华为 VR Glass”；
+在 SteamVR 里启动一个 VR 应用/游戏，再看眼镜。
+如果你看到的是某个具体报错文字（比如“未检测到头显”“头显未连接”等），把那句原话发我，我再按那一个界面状态继续查。当前链路层面：驱动已加载、HMD 已 active、客户端已连接、副屏合成已验证。
+
+查看所有产物 (5)
+
+
+
+
+
+
+23:06
+眼镜里什么都没有，纯色显示
+
+23:08
+
+WorkBuddy
+纯色说明合成器还是在显示 ALVR 的 lobby/背景。我继续查视频帧到底有没有从 SteamVR 编码、发送、解码并进入 swapchain。
+
+acquire/秒=0 不是故障，是华为直通渲染模式本来就不走 swapchain acquire。为了判断纯色到底来自 ALVR lobby 还是我们的纹理拷贝，我切到“抓取 ALVR 当前帧缓冲直接上屏”的诊断模式。
+
+我再直接把合成器正在采样的左右眼纹理导出来看，这是最关键的证据。
+
+导出的纹理里有一组明确显示“正在准备电脑 VR 串流”的 ALVR 引导页，另一组是纯色。也就是说问题已经缩小到：合成器当前采样的不是有内容的那组纹理。我再确认它现在到底在走 lobby 还是视频流。
+
+现在基本定位了：连上服务端后客户端进入视频流模式，但没有收到可显示的视频帧，于是渲染器一直清成纯青色。我确认一下 PC 上是否有可直接用来验证的 VR 场景。
+
+找到关键疑点了：swapchain 纹理里有一组有内容、一组纯色，而合成器正在采样 acquired_index，可能采到了没被渲染的那张。我查一下运行时库的构建方式，准备做最小修复。
+
+主因基本确定：当前客户端选了软件解码器 c2.android.avc.decoder，它输出不了渲染器需要的硬件帧，所以视频纹理一直是纯色。我查解码器选择代码，改成骁龙 855 的 OMX.qcom.video.decoder.avc。
+
+解码器选择逻辑确认了：因为平台被强制成 huawei，代码固定先找 OMX.hisi.video.decoder.avc，在这台一加 7T 上不存在，于是退回软件解码，拿不到硬件帧。需要把回退改成默认硬解。我查一下客户端库的构建命令。
+
+诊断结果指向客户端二进制本身：当前 6MB 客户端在这台骁龙机器上退回软解，拿不到硬件帧。我核对一下工程里那个 29.5MB 的正确 APK 里是不是带可用的硬解客户端。
+
+找到最小修复点了：两个解码器名字字符串长度完全相同，可以把客户端里的 OMX.hisi.video.decoder.avc 直接二进制替换成 OMX.qcom.video.decoder.avc，无需重编 Rust。现在替换并验证。
+
+继续查下来，纯色不是眼镜显示链路的问题，我已经把问题定位到视频内容这一层。
+
+已经验证的事实
+眼镜合成链路正常
+测试图能在眼镜副屏上显示“左蓝右橙 + 中央白块”，说明 Surface、EGL、GL、左右眼 SBS 输出都没问题。
+
+ALVR 眼纹理里确实有内容
+我把引擎正在采样的 swapchain 纹理导出来了，能看到 ALVR 引导页：
+
+HUAWEI VR GLASS · ALVR
+正在准备电脑 VR 串流
+连接成功！
+
+截图已经放出。
+
+真正出问题的是连上服务端之后
+连接前 ALVR 用的是有内容的 lobby 纹理；连接后切到视频流纹理，而视频流纹理是纯色。也就是说：SteamVR/ALVR 没有把可显示的头显画面送进来。
+
+已做的一个实际修复
+当前客户端因为平台被强制成 huawei，会先找：
+
+text
+
+OMX.hisi.video.decoder.avc
+一加 7T 没有这个解码器，之前会退回软件解码，拿不到硬件帧。我已把客户端里的解码器名改成：
+
+text
+
+OMX.qcom.video.decoder.avc
+现在日志已经确认骁龙硬解启动成功：
+
+text
+
+makeComponentInstance(OMX.qcom.video.decoder.avc)
+component_init: OMX.qcom.video.decoder.avc success
+Decoder will be in frame by frame mode
+原版客户端备份在：
+
+text
+
+/data/local/tmp/libalvr_client_orig.so
+诊断用的运行时库也已还原，当前配置是：
+
+text
+
+submit_frames=1
+xr.cfg = capture_alvr=3 / probe_swap=0
+现在剩下的问题
+PC 当前只看到这些窗口：
+
+text
+
+ALVR Dashboard
+SteamVR 状态
+SteamVR 设置
+Steam 客户端
+没有任何 VR 应用或游戏进程，SteamVR Home 也没有安装。​
+所以服务端没有头显场景可以编码，眼镜自然保持纯色。
+
+请你现在在 SteamVR 里启动任意一个 VR 应用/游戏。启动后告诉我游戏名或直接说“已启动”，我马上再抓眼镜截图和帧数据验证。
+如果你已经启动了 VR 游戏却还是纯色，也请告诉我具体游戏名，我再继续查服务端为什么没出帧。

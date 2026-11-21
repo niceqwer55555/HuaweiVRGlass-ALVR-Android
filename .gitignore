@@ -1,0 +1,26 @@
+# 私有记忆与临时文件
+.workbuddy/
+*.bak
+*.bak-*
+*.orig
+*~
+
+# 日志与崩溃转储
+*.log
+crash_log.txt
+session_log.txt
+
+# NDK 编译中间产物
+obj/
+libs/
+*.o
+*.a
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+
+# 签名私钥（避免泄露；私有仓库需要可手动移除本行）
+04-SRC/signing/key.pem
+04-SRC/signing/key_pk8.pem
+04-SRC/signing/key.der

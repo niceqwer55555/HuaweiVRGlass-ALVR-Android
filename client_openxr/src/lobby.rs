@@ -1,0 +1,427 @@
+use crate::{
+    from_xr_time,
+    graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
+    interaction::{self, InteractionContext},
+};
+use alvr_common::{glam::UVec2, info, parking_lot::RwLock, Pose};
+#[cfg(target_os = "android")]
+use alvr_graphics::HuaweiFramebufferRenderer;
+use alvr_graphics::{
+    BodyTrackingType, GraphicsContext, LobbyRenderer, LobbyViewParams, SDR_FORMAT_GL,
+};
+use alvr_system_info::Platform;
+use openxr as xr;
+use std::{rc::Rc, sync::Arc, time::Duration};
+
+pub(crate) type LobbySwapchains = (
+    [xr::Swapchain<xr::OpenGlEs>; 2],
+    [Vec<<xr::OpenGlEs as xr::Graphics>::SwapchainImage>; 2],
+);
+
+#[cfg(target_os = "android")]
+pub(crate) fn create_huawei_swapchains(
+    xr_session: &xr::Session<xr::OpenGlEs>,
+    view_resolution: UVec2,
+) -> LobbySwapchains {
+    let left_swapchain = graphics::create_swapchain_for_current_context(
+        xr_session,
+        view_resolution,
+        SDR_FORMAT_GL,
+        None,
+    );
+    let left_textures = left_swapchain
+        .enumerate_images()
+        .expect("failed to enumerate the left-eye Huawei swapchain images");
+
+    let right_swapchain = graphics::create_swapchain_for_current_context(
+        xr_session,
+        view_resolution,
+        SDR_FORMAT_GL,
+        None,
+    );
+    let right_textures = right_swapchain
+        .enumerate_images()
+        .expect("failed to enumerate the right-eye Huawei swapchain images");
+
+    info!(
+        "[HVR-DIAG] official-first lobby GLES swapchain textures: left={left_textures:?}, right={right_textures:?}"
+    );
+
+    (
+        [left_swapchain, right_swapchain],
+        [left_textures, right_textures],
+    )
+}
+
+pub(crate) fn create_swapchains(
+    xr_session: &xr::Session<xr::OpenGlEs>,
+    gfx_ctx: &GraphicsContext,
+    view_resolution: UVec2,
+    interleave_creation_and_enumeration: bool,
+) -> LobbySwapchains {
+    let (swapchains, swapchain_textures) = if interleave_creation_and_enumeration {
+        // Huawei's legacy runtime expects each swapchain to be enumerated immediately after
+        // creation. Creating both eyes first leaves its internal image buffers uninitialized.
+        let left_swapchain = graphics::create_swapchain(
+            xr_session,
+            gfx_ctx,
+            view_resolution,
+            SDR_FORMAT_GL,
+            None,
+            false,
+        );
+        let left_textures = left_swapchain
+            .enumerate_images()
+            .expect("failed to enumerate the left-eye OpenXR swapchain images");
+
+        let right_swapchain = graphics::create_swapchain(
+            xr_session,
+            gfx_ctx,
+            view_resolution,
+            SDR_FORMAT_GL,
+            None,
+            false,
+        );
+        let right_textures = right_swapchain
+            .enumerate_images()
+            .expect("failed to enumerate the right-eye OpenXR swapchain images");
+
+        (
+            [left_swapchain, right_swapchain],
+            [left_textures, right_textures],
+        )
+    } else {
+        let swapchains = [
+            graphics::create_swapchain(
+                xr_session,
+                gfx_ctx,
+                view_resolution,
+                SDR_FORMAT_GL,
+                None,
+                true,
+            ),
+            graphics::create_swapchain(
+                xr_session,
+                gfx_ctx,
+                view_resolution,
+                SDR_FORMAT_GL,
+                None,
+                true,
+            ),
+        ];
+        let swapchain_textures = [
+            swapchains[0]
+                .enumerate_images()
+                .expect("failed to enumerate the left-eye OpenXR swapchain images"),
+            swapchains[1]
+                .enumerate_images()
+                .expect("failed to enumerate the right-eye OpenXR swapchain images"),
+        ];
+
+        (swapchains, swapchain_textures)
+    };
+    info!(
+        "[HVR-DIAG] lobby GLES swapchain textures: left={:?}, right={:?}",
+        swapchain_textures[0], swapchain_textures[1]
+    );
+
+    (swapchains, swapchain_textures)
+}
+
+// todo: add interaction?
+pub struct Lobby {
+    xr_session: xr::Session<xr::OpenGlEs>,
+    interaction_ctx: Arc<RwLock<InteractionContext>>,
+    platform: Platform,
+    reference_space: xr::Space,
+    swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
+    view_resolution: UVec2,
+    reference_space_type: xr::ReferenceSpaceType,
+    renderer: LobbyRendererBackend,
+}
+
+enum LobbyRendererBackend {
+    Standard(LobbyRenderer),
+    #[cfg(target_os = "android")]
+    Huawei(HuaweiFramebufferRenderer),
+}
+
+impl Lobby {
+    pub fn new(
+        xr_session: xr::Session<xr::OpenGlEs>,
+        gfx_ctx: Rc<GraphicsContext>,
+        interaction_ctx: Arc<RwLock<InteractionContext>>,
+        platform: Platform,
+        view_resolution: UVec2,
+        initial_hud_message: &str,
+        precreated_swapchains: Option<LobbySwapchains>,
+    ) -> Self {
+        let reference_space_type = if xr_session.instance().exts().ext_local_floor.is_some() {
+            xr::ReferenceSpaceType::LOCAL_FLOOR_EXT
+        } else {
+            // The Quest 1 doesn't support LOCAL_FLOOR_EXT, recentering is required for AppLab, but
+            // the Quest 1 is excluded from AppLab anyway.
+            xr::ReferenceSpaceType::STAGE
+        };
+
+        let reference_space = interaction::get_reference_space(&xr_session, reference_space_type);
+
+        let (swapchains, swapchain_textures) = precreated_swapchains
+            .unwrap_or_else(|| create_swapchains(&xr_session, &gfx_ctx, view_resolution, false));
+
+        #[cfg(target_os = "android")]
+        let renderer = if platform.is_huawei() {
+            LobbyRendererBackend::Huawei(HuaweiFramebufferRenderer::new(
+                gfx_ctx,
+                view_resolution,
+                initial_hud_message,
+                swapchain_textures,
+            ))
+        } else {
+            LobbyRendererBackend::Standard(LobbyRenderer::new(
+                gfx_ctx,
+                view_resolution,
+                swapchain_textures,
+                initial_hud_message,
+            ))
+        };
+
+        #[cfg(not(target_os = "android"))]
+        let renderer = LobbyRendererBackend::Standard(LobbyRenderer::new(
+            gfx_ctx,
+            view_resolution,
+            swapchain_textures,
+            initial_hud_message,
+        ));
+
+        Self {
+            xr_session,
+            interaction_ctx,
+            platform,
+            reference_space,
+            swapchains,
+            view_resolution,
+            reference_space_type,
+            renderer,
+        }
+    }
+
+    pub fn update_reference_space(&mut self) {
+        self.reference_space =
+            interaction::get_reference_space(&self.xr_session, self.reference_space_type);
+    }
+
+    pub fn update_hud_message(&self, message: &str) {
+        match &self.renderer {
+            LobbyRendererBackend::Standard(renderer) => renderer.update_hud_message(message),
+            #[cfg(target_os = "android")]
+            LobbyRendererBackend::Huawei(renderer) => renderer.update_hud_message(message),
+        }
+    }
+
+    pub fn render(&mut self, vsync_time: Duration) -> ProjectionLayerBuilder {
+        let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
+
+        let (flags, maybe_views) = self
+            .xr_session
+            .locate_views(
+                xr::ViewConfigurationType::PRIMARY_STEREO,
+                xr_vsync_time,
+                &self.reference_space,
+            )
+            .unwrap();
+
+        let views = if flags.contains(xr::ViewStateFlags::ORIENTATION_VALID) {
+            maybe_views
+        } else {
+            vec![crate::default_view(), crate::default_view()]
+        };
+
+        self.xr_session
+            .sync_actions(&[(&self.interaction_ctx.read().action_set).into()])
+            .ok();
+
+        // Huawei: log every button transition locally, so the remote can be verified without a
+        // server connection (during streaming the same states are sent over the network instead).
+        if self.platform.is_huawei() {
+            interaction::log_huawei_button_changes(
+                &self.xr_session,
+                &self.interaction_ctx.read().button_actions,
+            );
+        }
+
+        #[cfg(target_os = "android")]
+        if self.platform.is_huawei() {
+            static LOBBY_TRACE: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = LOBBY_TRACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            if n < 200 {
+                info!("[HVR-DIAG] lobby frame {n}: actions synced, reading hand data");
+            }
+        }
+
+        // future_time doesn't have to be any particular value, just something after vsync_time
+        let future_time = vsync_time + Duration::from_millis(80);
+        let left_hand_data = interaction::get_hand_data(
+            &self.xr_session,
+            self.platform,
+            &self.reference_space,
+            vsync_time,
+            future_time,
+            &self.interaction_ctx.read().hands_interaction[0],
+            &mut Pose::default(),
+            &mut Pose::default(),
+        );
+        let right_hand_data = interaction::get_hand_data(
+            &self.xr_session,
+            self.platform,
+            &self.reference_space,
+            vsync_time,
+            future_time,
+            &self.interaction_ctx.read().hands_interaction[1],
+            &mut Pose::default(),
+            &mut Pose::default(),
+        );
+
+        let additional_motions = self
+            .interaction_ctx
+            .read()
+            .body_sources
+            .motion_tracker_bd
+            .as_ref()
+            .map(|tracker| {
+                interaction::get_bd_motion_trackers(from_xr_time(xr_vsync_time), tracker)
+            })
+            .map(|vec| vec.iter().map(|(_, motion)| *motion).collect());
+
+        let body_skeleton_fb = self
+            .interaction_ctx
+            .read()
+            .body_sources
+            .body_tracker_fb
+            .as_ref()
+            .and_then(|(tracker, joint_count)| {
+                interaction::get_fb_body_skeleton(
+                    &self.reference_space,
+                    xr_vsync_time,
+                    tracker,
+                    *joint_count,
+                )
+            });
+
+        let body_skeleton_bd = self
+            .interaction_ctx
+            .read()
+            .body_sources
+            .body_tracker_bd
+            .as_ref()
+            .and_then(|tracker| {
+                interaction::get_bd_body_skeleton(&self.reference_space, xr_vsync_time, tracker)
+            });
+
+        let (body_skeleton, body_tracking_type) = {
+            if body_skeleton_fb.is_some() {
+                (body_skeleton_fb, Some(BodyTrackingType::Meta))
+            } else if body_skeleton_bd.is_some() {
+                (body_skeleton_bd, Some(BodyTrackingType::Pico))
+            } else {
+                (None, None)
+            }
+        };
+
+        match &self.renderer {
+            LobbyRendererBackend::Standard(renderer) => {
+                let left_swapchain_idx = self.swapchains[0].acquire_image().unwrap();
+                let right_swapchain_idx = self.swapchains[1].acquire_image().unwrap();
+
+                self.swapchains[0]
+                    .wait_image(xr::Duration::INFINITE)
+                    .unwrap();
+                self.swapchains[1]
+                    .wait_image(xr::Duration::INFINITE)
+                    .unwrap();
+
+                renderer.render(
+                    [
+                        LobbyViewParams {
+                            pose: crate::from_xr_pose(views[0].pose),
+                            fov: crate::from_xr_fov(views[0].fov),
+                            swapchain_index: left_swapchain_idx,
+                        },
+                        LobbyViewParams {
+                            pose: crate::from_xr_pose(views[1].pose),
+                            fov: crate::from_xr_fov(views[1].fov),
+                            swapchain_index: right_swapchain_idx,
+                        },
+                    ],
+                    [left_hand_data, right_hand_data],
+                    additional_motions,
+                    body_skeleton,
+                    body_tracking_type,
+                    false,
+                    cfg!(debug_assertions),
+                );
+
+                self.swapchains[0].release_image().unwrap();
+                self.swapchains[1].release_image().unwrap();
+            }
+            #[cfg(target_os = "android")]
+            LobbyRendererBackend::Huawei(renderer) => {
+                static LOBBY_RENDER_TRACE: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = LOBBY_RENDER_TRACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                // The Huawei runtime rejects every swapchain call: xrAcquireSwapchainImage needs a
+                // begun frame (this runtime has no working xrBeginFrame) and its enumerated image
+                // handles are all zero anyway. The renderer draws straight into the HVR surface
+                // instead, so simply render both eyes and let xrEndFrame carry no layers.
+                for eye in 0..2 {
+                    if n < 200 {
+                        info!("[HVR-DIAG] lobby frame {n}: render eye {eye}");
+                    }
+                    renderer.render_view(eye);
+                    if n < 200 {
+                        info!("[HVR-DIAG] lobby frame {n}: rendered eye {eye}");
+                    }
+                }
+            }
+        }
+
+        let rect = xr::Rect2Di {
+            offset: xr::Offset2Di { x: 0, y: 0 },
+            extent: xr::Extent2Di {
+                width: self.view_resolution.x as _,
+                height: self.view_resolution.y as _,
+            },
+        };
+
+        ProjectionLayerBuilder::new(
+            &self.reference_space,
+            [
+                xr::CompositionLayerProjectionView::new()
+                    .pose(views[0].pose)
+                    .fov(views[0].fov)
+                    .sub_image(
+                        xr::SwapchainSubImage::new()
+                            .swapchain(&self.swapchains[0])
+                            .image_array_index(0)
+                            .image_rect(rect),
+                    ),
+                xr::CompositionLayerProjectionView::new()
+                    .pose(views[1].pose)
+                    .fov(views[1].fov)
+                    .sub_image(
+                        xr::SwapchainSubImage::new()
+                            .swapchain(&self.swapchains[1])
+                            .image_array_index(0)
+                            .image_rect(rect),
+                    ),
+            ],
+            Some(ProjectionLayerAlphaConfig {
+                premultiplied: true,
+            }),
+            None,
+        )
+    }
+}

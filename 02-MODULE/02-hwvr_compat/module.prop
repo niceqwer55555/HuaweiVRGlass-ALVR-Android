@@ -1,0 +1,6 @@
+id=hwvr_compat
+name=HWVR Glass Compat
+version=v3
+versionCode=3
+author=hvr-port
+description=v3: /dev/hwvr1 by protocol response + OTG 5V lock + activate & input-stream event decode (proximity/battery -> sys.hwvr.*) + 3DoF pose helper. SELinux stays enforcing.

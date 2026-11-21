@@ -1,0 +1,6 @@
+id=alvr7t_runtime
+name=ALVR 7T Runtime Injector
+version=v0.1
+versionCode=1
+author=Doubao
+description=把自研 OpenXR runtime(libvrsdk.so) bind-mount 进 com.lht.huaweivr.alvr 的 lib 目录，免重装 APK。需先装原版 APK。
