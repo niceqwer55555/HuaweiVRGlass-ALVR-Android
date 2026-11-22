@@ -413,12 +413,21 @@ static void hid_stop(void) {
 typedef int (*vrpose_start_t)(void);
 typedef int (*vrpose_stop_t)(void);
 typedef int (*vrpose_get_t)(void *out);
+/* [10055 mitigation] HelmetPose::getPose(VrPosture*) 是 C++ 成员函数(ARM),
+ * 内部不打日志; 而 C API HelmetPoseGet() 每次调用都打一条 logcat(200Hz→刷屏,
+ * 拖慢进程导致服务端UDP缓冲区满 10055 -> 眼镜黑屏)。默认直接调 getPose 静默取姿态。
+ * 放 files/vrpose_logging 文件可回退到原 HelmetPoseGet(调试用)。
+ * libvrpose.so: getPose VA=0xdb6c, Singleton<HelmetPose>::instance_ VA=0x25054 */
+typedef void (*helmet_getpose_t)(void *self, void *out);
 
 static struct {
     void *lib;
     vrpose_start_t start;
     vrpose_stop_t stop;
     vrpose_get_t get;
+    helmet_getpose_t getpose;   /* 静默版: 绕过 HelmetPoseGet 的日志 */
+    void *self;                 /* HelmetPose 单例(Start 后读 instance_) */
+    bool quiet;                 /* true=用 getPose 静默取姿态 */
     pthread_t th;
     bool running;
     xq_t ref;          /* recenter 基准：数据开始流动那一刻的姿态 */
@@ -437,8 +446,23 @@ static bool vrpose_load(void) {
     g_vrp.start = (vrpose_start_t)dlsym(g_vrp.lib, "HelmetPoseStart");
     g_vrp.stop = (vrpose_stop_t)dlsym(g_vrp.lib, "HelmetPoseStop");
     g_vrp.get = (vrpose_get_t)dlsym(g_vrp.lib, "HelmetPoseGet");
-    XLOG("VRPOSE: 符号 start=%p stop=%p get=%p",
-         (void *)g_vrp.start, (void *)g_vrp.stop, (void *)g_vrp.get);
+    {
+        FILE *fq = fopen("/sdcard/Android/data/com.lht.huaweivr.alvr/files/vrpose_logging", "r");
+        if (fq) { fclose(fq); g_vrp.quiet = false; }
+        else {
+            /* 静默取姿态: dlsym getPose + dladdr 拿 base 读单例 */
+            Dl_info di;
+            void *sym = dlsym(g_vrp.lib, "_ZN10HelmetPose7getPoseEP9VrPosture");
+            if (sym && dladdr(sym, &di) && di.dli_fbase) {
+                g_vrp.getpose = (helmet_getpose_t)sym;
+                g_vrp.self = *(void **)((uintptr_t)di.dli_fbase + 0x25054); /* 稍后Start后再读 */
+                g_vrp.quiet = true;
+            }
+        }
+    }
+    XLOG("VRPOSE: 符号 start=%p stop=%p get=%p getpose=%p quiet=%d",
+         (void *)g_vrp.start, (void *)g_vrp.stop, (void *)g_vrp.get,
+         (void *)g_vrp.getpose, g_vrp.quiet);
     if (!g_vrp.get) {
         dlclose(g_vrp.lib);
         g_vrp.lib = NULL;
@@ -452,11 +476,26 @@ static void *vrpose_thread_fn(void *arg) {
     unsigned char buf[128];
     int rc = g_vrp.start ? g_vrp.start() : -1;
     XLOG("VRPOSE: HelmetPoseStart() 返回 %d", rc);
+    /* Start 后单例才建立, 重新读 instance_ 拿 this */
+    if (g_vrp.quiet && g_vrp.getpose) {
+        Dl_info di2;
+        void *sym2 = dlsym(g_vrp.lib, "_ZN10HelmetPose7getPoseEP9VrPosture");
+        if (sym2 && dladdr(sym2, &di2) && di2.dli_fbase) {
+            g_vrp.self = *(void **)((uintptr_t)di2.dli_fbase + 0x25054);
+        }
+        XLOG("VRPOSE: 静默模式 self=%p", g_vrp.self);
+    }
 
     int n = 0, valid = 0, bad = 0;
     while (g_vrp.running) {
         memset(buf, 0, sizeof(buf));
-        int r = g_vrp.get(buf);
+        int r;
+        if (g_vrp.quiet && g_vrp.getpose && g_vrp.self) {
+            g_vrp.getpose(g_vrp.self, buf);  /* 静默: 不打 logcat */
+            r = 0;
+        } else {
+            r = g_vrp.get ? g_vrp.get(buf) : -1;
+        }
         float f[8];
         memcpy(f, buf, sizeof(f));
 
@@ -509,7 +548,11 @@ static void *vrpose_thread_fn(void *arg) {
                 bad++;
             }
         }
-        usleep(5000); /* 200Hz */
+        /* [10055 mitigation] 眼镜物理刷新率 70Hz, 200Hz 采样是浪费。
+         * 更关键: SDK 的 HelmetPoseGet() 每次调用都会打一条 logcat(200条/s),
+         * 拖慢整个进程(含视频接收线程) -> 服务端UDP发送缓冲区满 -> os error 10055
+         * -> 视频线程死 -> 眼镜黑屏。降到 70Hz 大幅降低日志与CPU压力。 */
+        usleep(14000); /* ~70Hz */
     }
 
     if (g_vrp.stop) g_vrp.stop();

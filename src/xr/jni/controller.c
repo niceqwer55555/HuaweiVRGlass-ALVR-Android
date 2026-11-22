@@ -132,7 +132,7 @@ static void *ctrl_thread(void *arg) {
                      imu_fd >= 0 ? "hidraw3" : "phone");
             }
         }
-        usleep(5000); /* 200Hz */
+        usleep(14000); /* ~70Hz, 与头显刷新率一致, 降低CPU压力 */
     }
     if (imu_fd >= 0) close(imu_fd);
     if (s_stop) s_stop();
