@@ -81,6 +81,8 @@ static void jni_slam_probe(JNIEnv *env, jclass cls, jobject activity) {
         if (g_probe_activity) (*env)->DeleteGlobalRef(env, g_probe_activity);
         g_probe_activity = (*env)->NewGlobalRef(env, activity);
     }
+    /* 注意：不要改成同步调用。探针里的 SlamState::Init 会起内部线程并可能
+     * 长时间阻塞，同步跑会卡死 Java 的 watcher 线程(它还要轮询触发文件)。 */
     pthread_t t;
     if (pthread_create(&t, NULL, slam_probe_thread, NULL) == 0) {
         pthread_detach(t);
@@ -123,7 +125,15 @@ static void jni_ctrl_probe(JNIEnv *env, jclass cls) {
     }
 }
 
+/* HvrApi 6DoF 手柄桥接：传入 Activity 初始化华为 VR SDK */
+static void jni_init_hvr(JNIEnv *env, jclass cls, jobject activity) {
+    (void)cls;
+    XLOG("JNI: nativeInitHvr 调用");
+    hvr_bridge_init(env, activity);
+}
+
 static const JNINativeMethod k_methods[] = {
+        {"nativeInitHvr", "(Landroid/app/Activity;)V", (void *)jni_init_hvr},
         {"nativeSetSurface", "(Landroid/view/Surface;)V", (void *)jni_set_surface},
         {"nativeProbe", "()I", (void *)jni_probe},
         {"nativePoseDriver", "()Ljava/lang/String;", (void *)jni_driver},

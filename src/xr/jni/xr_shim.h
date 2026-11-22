@@ -293,4 +293,14 @@ void xr_hid_probe_run(void);
  * 走 Huawei 自己的 Singleton<PhoneControllerPose>，start 之后 getPose 取值。 */
 void xr_ctrl_probe_run(void);
 
+/* ---------- 手柄姿态数据源（controller.c） ----------
+ * 持续采样 PhoneControllerPose，供 action space / locate space 使用。 */
+bool xr_controller_init(void);
+bool xr_controller_get_pose(int hand, xq_t *rot, xv3_t *pos);
+int xr_controller_samples(int hand);
+
+/* ---------- HvrApi 6DoF 桥接（hvr_bridge.c） ---------- */
+void hvr_bridge_init(JNIEnv *env, jobject activity);
+void hvr_bridge_stop(void);
+
 #endif /* XR_SHIM_H */

@@ -169,6 +169,7 @@ XrResult xrCreateInstance(const XrInstanceCreateInfo *createInfo, XrInstance *in
     *instance = g_xr.instance;
 
     xr_pose_init();
+    xr_controller_init();   /* 手柄姿态数据源（PhoneControllerPose） */
     return XR_SUCCESS;
 }
 
@@ -463,7 +464,16 @@ static bool space_pose_in_stage(const space_t *s, xq_t *rot, xv3_t *pos, bool *h
             pos->x = pos->y = pos->z = 0;
             *has_pos = true;
             return true;
-        case SPACE_ACTION:
+        case SPACE_ACTION: {
+            /* 手柄 action space：用 subaction path 区分左右手。
+             * 客户端绑定的是 /user/hand/left|right/input/grip|aim/pose。 */
+            int hand = 0;
+            const char *path = xr_path_lookup(s->subaction);
+            if (path && strstr(path, "right")) hand = 1;
+            if (!xr_controller_get_pose(hand, rot, pos)) return false;
+            *has_pos = true;
+            return true;
+        }
         default:
             return false;
     }
@@ -942,7 +952,8 @@ XrResult xrGetActionStatePose(XrSession session, const XrActionStateGetInfo *get
     if (!state) return XR_ERROR_VALIDATION_FAILURE;
     memset(state, 0, sizeof(*state));
     state->type = XR_TYPE_ACTION_STATE_POSE;
-    state->isActive = XR_FALSE;
+    /* 手柄 pose action 始终 active，让客户端去 locate space 拿姿态 */
+    state->isActive = XR_TRUE;
     return XR_SUCCESS;
 }
 

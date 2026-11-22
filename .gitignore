@@ -24,3 +24,19 @@ Thumbs.db
 04-SRC/signing/key.pem
 04-SRC/signing/key_pk8.pem
 04-SRC/signing/key.der
+
+# 归档的会话日志(含刷屏日志)
+session_log_*.txt
+*.zip
+
+# 预编译 SDK/工具库与二进制(体积大, 不入库)
+lib/
+03-TOOLS/
+server/bin/
+server/licenses/
+server/platform-tools/
+server/*.exe
+src/controller_probe/controller_probe
+
+# 服务端运行时状态(用户要求不改服务端)
+server/session.json
